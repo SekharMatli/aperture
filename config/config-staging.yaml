@@ -1,0 +1,99 @@
+# =============================================================================
+# eBPF API Capture Agent — STAGING CONFIG
+# =============================================================================
+# Usage:
+#   sudo python -m src.agent --config config/agent.staging.yaml
+#
+# Designed for: a single staging Linux host or VM
+# Ring buffer:  128 MB  (handles moderate traffic bursts)
+# Output:       stdout (JSON) + rotating JSONL file
+# Logging:      INFO + JSON format (structured, ready for log aggregators)
+# TLS capture:  enabled
+# Filters:      standard API + AI service ports
+# =============================================================================
+
+
+# ── BPF Program ───────────────────────────────────────────────────────────────
+
+bpf_object_path: src/bpf/http_capture.c
+ringbuf_size_mb: 128
+
+
+# ── Traffic Filters ───────────────────────────────────────────────────────────
+
+port_filter:
+  - 80       # HTTP
+  - 443      # HTTPS / gRPC-TLS
+  - 8080     # HTTP alt (internal services)
+  - 8443     # HTTPS alt
+  - 8000     # Python app servers
+  - 9000     # PHP-FPM / generic
+  - 50051    # gRPC (plaintext, default port)
+  - 50052    # gRPC-TLS (default port)
+  - 11434    # Ollama
+
+pid_filter: []   # watch all processes on the staging host
+
+capture_tls: true
+
+
+# ── SSL / TLS Uprobe ─────────────────────────────────────────────────────────
+
+ssl:
+  enabled: true
+  lib_paths: []   # auto-discover via ldconfig
+
+
+# ── Output Backends ───────────────────────────────────────────────────────────
+
+outputs:
+  # Stdout as structured JSON — piped to log aggregator (Datadog, Splunk, etc.)
+  - type: stdout
+    pretty: false
+
+  # Rotating JSONL file — local backup, useful for replay and debugging
+  - type: file
+    path: /var/log/ebpf-agent/events.jsonl
+    rotate_mb: 200       # rotate when file hits 200 MB
+    max_files: 5         # keep 5 rotated files (5 × 200 MB = 1 GB max)
+    compress: true       # gzip rotated files to save disk
+
+  # Webhook to staging governance platform
+  # Uncomment when your governance ingestion endpoint is ready:
+  # - type: webhook
+  #   url: https://ingest.staging.your-platform.io/v1/events
+  #   headers:
+  #     Authorization: "Bearer ${GOVERNANCE_API_KEY}"
+  #     X-Agent-Host: staging-host-01
+  #   batch_size: 100
+  #   timeout_s: 5
+  #   max_retries: 3
+
+  # Add Kafka as well
+  # TODO
+
+
+# ── Prometheus Metrics ────────────────────────────────────────────────────────
+
+prometheus:
+  enabled: true
+  port: 9090
+  path: /metrics
+  # Scrape this with Prometheus on staging:
+  #   - job_name: ebpf-agent
+  #     static_configs:
+  #       - targets: ['staging-host:9090']
+
+
+# ── Connection Tracking ───────────────────────────────────────────────────────
+
+sweep_interval_s: 30
+connection_ttl_s: 180     # 3 minutes — staging services have shorter lifetimes
+max_connections: 32768    # 32K — staging rarely hits prod connection counts
+stats_interval_s: 15
+
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+log_level: INFO
+log_format: json    # structured JSON — forward to your log aggregator

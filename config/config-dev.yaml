@@ -1,0 +1,118 @@
+# =============================================================================
+# eBPF API Capture Agent — LOCAL DEVELOPMENT CONFIG
+# =============================================================================
+# Usage:
+#   sudo python -m src.agent --config config/agent.dev.yaml
+#
+# Designed for: MacBook Lima VM / local Ubuntu VM
+# Ring buffer:  64 MB  (minimum, fine for low local traffic)
+# Output:       stdout only, pretty-printed for readability
+# Logging:      DEBUG + text format so you can read it in a terminal
+# TLS capture:  enabled (attach SSL uprobes if libssl is found)
+# Filters:      watch common dev ports; no PID filter (watch everything)
+# =============================================================================
+
+
+# ── BPF Program ───────────────────────────────────────────────────────────────
+
+# Path to BPF source (.c = compiled by BCC at runtime using host kernel headers)
+# Switch to .o (pre-compiled ELF) for faster startup once you have a stable build
+bpf_object_path: src/bpf/http_capture.c
+
+# Ring buffer size in MB — must be a power of 2 (kernel requirement)
+# AgentConfig auto-rounds up: e.g. 100 → 128
+# 64 MB is fine for a dev laptop; increase if you see kernel_drops in logs
+ringbuf_size_mb: 64
+
+
+# ── Traffic Filters ───────────────────────────────────────────────────────────
+
+# TCP ports to observe. Empty list [] = capture ALL ports (expensive on busy hosts)
+# Common dev ports: HTTP, HTTPS, gRPC, common app servers, AI API endpoints
+port_filter:
+  - 80       # HTTP
+  - 443      # HTTPS
+  - 3000     # Node.js / React dev server
+  - 4000     # Common API dev port
+  - 8000     # Python (uvicorn, gunicorn default)
+  - 8080     # Generic HTTP alt
+  - 8443     # HTTPS alt
+  - 8888     # Jupyter
+  - 11434    # Ollama local LLM
+
+# PIDs to capture. Empty list [] = capture all processes.
+# Useful in dev to focus on one service:
+#   pid_filter: [12345]
+# Or set at runtime:
+#   EBPF_AGENT_PID_FILTER=12345 sudo python -m src.agent ...
+pid_filter: []
+
+# Attach SSL uprobes to capture HTTPS plaintext.
+# Requires libssl.so accessible on the host (auto-discovered via ldconfig).
+# Set false if you see uprobe attachment errors and only care about plain HTTP.
+capture_tls: true
+
+
+# ── SSL / TLS Uprobe ─────────────────────────────────────────────────────────
+
+ssl:
+  enabled: true
+  # lib_paths: explicitly list libssl paths if auto-discovery fails.
+  # Leave empty to use ldconfig auto-discovery (recommended).
+  # Example override for non-standard install:
+  #   lib_paths:
+  #     - /usr/local/ssl/lib/libssl.so.3
+  lib_paths: []
+
+
+# ── Output Backends ───────────────────────────────────────────────────────────
+
+outputs:
+  # Stdout: pretty-printed JSON for local readability.
+  # In dev you want pretty: true so you can read events in the terminal.
+  - type: stdout
+    pretty: true
+
+  # Uncomment to also write raw JSONL to a local file for inspection:
+  # - type: file
+  #   path: /tmp/ebpf-agent-dev.jsonl
+  #   rotate_mb: 50
+  #   max_files: 3
+  #   compress: false    # no compression in dev — easier to cat/grep
+
+  # Add Kafka as well
+  # TODO
+
+# ── Prometheus Metrics ────────────────────────────────────────────────────────
+
+prometheus:
+  enabled: false      # disable in dev unless you're testing metrics
+  port: 9090
+  path: /metrics
+
+
+# ── Connection Tracking ───────────────────────────────────────────────────────
+
+# How often to scan for and evict idle connections (seconds)
+sweep_interval_s: 30
+
+# Evict connections not seen for this long (seconds)
+# 60s is fine in dev — you're not running long-lived connections typically
+connection_ttl_s: 60
+
+# Max tracked connections — matches BPF map capacity
+# Lower in dev is fine; saves memory
+max_connections: 8192
+
+# How often agent statistics are logged (events/sec, drops, active connections)
+stats_interval_s: 10
+
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+# DEBUG in dev: shows probe attachment, per-event parse details, sweep activity
+log_level: DEBUG
+
+# text: human-readable colored output for terminals
+# json: structured JSON lines (better for log aggregators, use in staging/prod)
+log_format: text

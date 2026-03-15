@@ -1,0 +1,192 @@
+# =============================================================================
+# eBPF API Capture Agent — PRODUCTION CONFIG
+# =============================================================================
+# Usage:
+#   sudo python -m src.agent --config config/agent.prod.yaml
+#
+# Designed for: production Linux host (EC2, GKE node, bare metal)
+# Ring buffer:  512 MB  (handles high-throughput API services)
+# Output:       Kafka (primary) + rotating file (backup/audit)
+# Logging:      WARNING + JSON (quiet in prod, errors only)
+# TLS capture:  enabled with explicit lib paths for reproducibility
+# Filters:      all standard API ports + AI/LLM service ports
+#
+# Environment variable overrides (set in systemd unit or Kubernetes secret):
+#   EBPF_AGENT_LOG_LEVEL=DEBUG          — temporary debug without restart
+#   EBPF_AGENT_PORT_FILTER=80,443       — narrow capture scope
+#   EBPF_AGENT_RINGBUF_SIZE_MB=1024     — increase if kernel_drops appear
+# =============================================================================
+
+
+# ── BPF Program ───────────────────────────────────────────────────────────────
+
+# In production, prefer a pre-compiled .o ELF (CO-RE) for faster startup
+# and to avoid requiring kernel headers on every host.
+# Use .c during rollout until you have a stable compiled artifact.
+bpf_object_path: src/bpf/http_capture.c
+
+# 512 MB ring buffer — power of 2, handles burst traffic from high-throughput
+# API services. Monitor ebpf_agent_drops_total in Prometheus; if it's
+# non-zero under normal load, increase to 1024.
+ringbuf_size_mb: 512
+
+
+# ── Traffic Filters ───────────────────────────────────────────────────────────
+
+# Capture all standard API and AI service ports.
+# Do NOT use empty list [] in production — it captures ALL TCP traffic
+# (database connections, internal RPCs, everything) and will overwhelm
+# the ring buffer on busy hosts.
+port_filter:
+  # Standard HTTP/HTTPS
+  - 80
+  - 443
+  # Common internal API ports
+  - 8000
+  - 8080
+  - 8443
+  - 8888
+  - 9000
+  # gRPC (plaintext + TLS)
+  - 50051
+  - 50052
+  # AI / LLM service ports
+  - 11434    # Ollama (local LLM)
+  - 11435    # Ollama alt
+  # Internal microservice mesh (adjust to your environment)
+  - 3000
+  - 4000
+  - 5000
+  - 7000
+  - 9090
+
+# PID filter — empty in production (watch all processes on the host)
+# Narrow this via EBPF_AGENT_PID_FILTER env var for targeted debugging
+pid_filter: []
+
+# Capture TLS plaintext via SSL uprobes — critical for HTTPS API governance.
+# Without this, all OpenAI / Anthropic / cloud API calls are encrypted blobs.
+capture_tls: true
+
+
+# ── SSL / TLS Uprobe ─────────────────────────────────────────────────────────
+
+ssl:
+  enabled: true
+
+  # In production, pin exact paths for reproducibility across host fleet.
+  # These cover Ubuntu 22.04 (x86_64 and arm64) and Amazon Linux 2023.
+  # Agent still falls back to ldconfig auto-discovery if these don't exist.
+  lib_paths:
+    - /usr/lib/x86_64-linux-gnu/libssl.so.3     # Ubuntu 22.04 x86_64
+    - /usr/lib/x86_64-linux-gnu/libssl.so.1.1   # Ubuntu 20.04 x86_64
+    - /usr/lib/aarch64-linux-gnu/libssl.so.3    # Ubuntu 22.04 ARM64
+    - /usr/lib64/libssl.so.3                    # Amazon Linux 2023 / RHEL 9
+    - /usr/lib64/libssl.so.1.1                  # Amazon Linux 2 / RHEL 8
+    - /usr/local/lib/libssl.so.3                # Custom / compiled installs
+
+
+# ── Output Backends ───────────────────────────────────────────────────────────
+
+outputs:
+  # ── PRIMARY: Kafka ──────────────────────────────────────────────────────────
+  # Events are keyed by conn_id so all packets from one connection land on
+  # the same partition — preserving request/response ordering for stream
+  # processors on the governance platform.
+  - type: kafka
+    brokers:
+      - kafka-broker-1.internal:9092
+      - kafka-broker-2.internal:9092
+      - kafka-broker-3.internal:9092
+    topic: api-events-raw
+
+    # Batching — balance latency vs throughput
+    # linger_ms=10: wait up to 10ms to fill a batch (reduces broker round-trips)
+    # batch_size=500: flush if 500 events accumulate before linger_ms
+    linger_ms: 10
+    batch_size: 500
+
+    # lz4 compression — fast and effective for JSON payloads (~5x reduction)
+    compression: lz4
+
+    # Per-connection ordering: same conn_id → same partition
+    # Do not change this — ordering is required for latency correlation
+    key_field: conn_id
+
+  # ── SECONDARY: Rotating file (audit trail + replay buffer) ─────────────────
+  # Local file provides:
+  #   1. Audit trail independent of Kafka (survives broker outage)
+  #   2. Replay source if Kafka consumer misses events
+  #   3. Forensics for security incidents
+  - type: file
+    path: /var/log/ebpf-agent/events.jsonl
+    rotate_mb: 500        # rotate at 500 MB
+    max_files: 10         # keep 10 files = up to 5 GB of compressed history
+    compress: true        # gzip on rotation (typically 5–8x compression for JSON)
+
+  # ── OPTIONAL: Webhook for real-time alerting ────────────────────────────────
+  # Uncomment to forward high-severity events (PII detected, anomalous patterns)
+  # to your governance platform's alert ingestion endpoint.
+  # - type: webhook
+  #   url: https://ingest.your-platform.io/v1/alerts
+  #   headers:
+  #     Authorization: "Bearer ${GOVERNANCE_API_KEY}"
+  #     X-Source: ebpf-agent
+  #     X-Host: "${HOSTNAME}"
+  #   batch_size: 50
+  #   timeout_s: 10
+  #   max_retries: 5
+  #   # Only forward events matching these conditions:
+  #   filter:
+  #     protocols: [HTTP/1.x, HTTP/2, gRPC]
+  #     min_body_bytes: 0
+
+
+# ── Prometheus Metrics ────────────────────────────────────────────────────────
+
+prometheus:
+  enabled: true
+  port: 9090
+  path: /metrics
+
+  # Key metrics to alert on:
+  #
+  # ebpf_agent_drops_total > 0
+  #   → Ring buffer filling; increase ringbuf_size_mb or reduce port_filter scope
+  #
+  # ebpf_agent_events_per_second < 1  (and you know traffic is flowing)
+  #   → Probe detachment or BPF program crash; check agent logs
+  #
+  # ebpf_agent_output_errors_total increasing
+  #   → Kafka broker unreachable or disk full; check output backends
+  #
+  # ebpf_agent_parse_errors_total / ebpf_agent_events_total > 0.01
+  #   → >1% parse failure rate; investigate protocol or payload issues
+
+
+# ── Connection Tracking ───────────────────────────────────────────────────────
+
+# Sweep every 60s — longer interval reduces CPU overhead on busy hosts
+sweep_interval_s: 60
+
+# Evict connections idle for 5 minutes — covers long-lived HTTP/2 streams
+# and gRPC bidirectional streams while preventing unbounded memory growth
+connection_ttl_s: 300
+
+# 65536 = max BPF map capacity (set in http_capture.c MAX_CONNECTIONS)
+# Matches the kernel-side limit exactly — do not set higher
+max_connections: 65536
+
+# Log stats every 30s in production (quieter than dev's 10s)
+stats_interval_s: 30
+
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+# WARNING in production: only log problems, not every event.
+# Use EBPF_AGENT_LOG_LEVEL=DEBUG env var for temporary debugging.
+log_level: WARNING
+
+# JSON: structured logs for Datadog / Splunk / CloudWatch / Elastic ingestion.
+# Each log line is a valid JSON object with timestamp, level, logger, and fields.
+log_format: json
