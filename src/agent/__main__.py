@@ -20,6 +20,7 @@ import sys
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pre-flight checks (run before any heavy imports)
+# CAP_BPF (introduced in Linux 5.8) and CAP_SYS_ADMIN are Linux capabilities controlling privileged operations
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _check_root() -> None:
