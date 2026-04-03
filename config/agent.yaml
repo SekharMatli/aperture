@@ -1,0 +1,123 @@
+# agent.yaml — eBPF Agent Configuration
+# =========================================
+# Single config file for all environments.
+# Override any value with env vars prefixed EBPF_AGENT_
+#   e.g. EBPF_AGENT_LOG_LEVEL=DEBUG
+#        EBPF_AGENT_AGENT_KEY=agk_your_key_here
+#
+# Required for Phase 0:
+#   AGENT_KEY     your project's agent key (from governance-cloud UI)
+#   KAFKA_BROKERS comma-separated broker list if different from default
+
+
+# ── BPF program ───────────────────────────────────────────────────────────────
+bpf_object_path: src/bpf/http_capture.c
+ringbuf_size_mb: 256
+
+
+# ── HTTP traffic filters ──────────────────────────────────────────────────────
+# port_filter: which TCP destination ports to capture HTTP traffic on.
+# Empty list = use the defaults (80, 443, 8080, 8443).
+port_filter:
+  - 80
+  - 443
+  - 8080
+  - 8443
+  - 3000
+  - 4000
+
+# pid_filter: restrict HTTP capture to a single process by PID.
+# Leave empty to capture all processes.
+pid_filter: []
+
+
+# ── Output backends ───────────────────────────────────────────────────────────
+# These are for the existing HTTP event stream (legacy sinks).
+# Phase 0 Kafka output is configured separately below under kafka_topic.
+outputs:
+  - type: stdout
+    pretty: false
+
+  # Uncomment to write NDJSON to a rotating file:
+  # - type: file
+  #   path: /var/log/ebpf-agent/events.jsonl
+  #   rotate_mb: 100
+  #   max_files: 10
+  #   compress: true
+
+
+# ── Prometheus metrics ────────────────────────────────────────────────────────
+prometheus:
+  enabled: true
+  port: 9090
+  path: /metrics
+
+
+# ── HTTP processing ───────────────────────────────────────────────────────────
+parse_bodies: true
+capture_headers: true
+max_body_capture_bytes: 4096
+
+
+# ── Reliability ───────────────────────────────────────────────────────────────
+event_queue_size: 100000
+worker_threads: 4
+
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_level: INFO      # DEBUG | INFO | WARNING | ERROR
+log_format: json     # json | text
+
+
+# ── Phase 0: Kafka envelope (versioned, all three streams) ───────────────────
+# agent_key is the X-Agent-Key credential for this host's project.
+# Set it here OR via the AGENT_KEY environment variable (preferred).
+#
+# agent_key: agk_your_key_here
+kafka_topic:   api-events
+kafka_brokers: localhost:9092
+
+
+# ── Phase 0: SSL content capture (ssl_content.bpf.c) ─────────────────────────
+# Captures decrypted TLS plaintext via uprobes on SSL_read / SSL_write.
+# This gives you the actual LLM prompt text and response text.
+capture_ssl_content:   true
+ssl_max_capture_bytes: 65536   # 64 KB per event; enough for one LLM turn
+
+# System libssl.so paths for standard OpenSSL (auto-detected if left empty).
+# The agent searches these paths in order and attaches to the first one found.
+# Uncomment and adjust if your libssl is in a non-standard location.
+# ssl_lib_paths:
+#   - /usr/lib/x86_64-linux-gnu/libssl.so.3
+#   - /usr/lib/x86_64-linux-gnu/libssl.so.1.1
+#   - /usr/lib/aarch64-linux-gnu/libssl.so.3
+#   - /usr/local/lib/libssl.so
+
+# ssl_binary_paths: paths to binaries with STATICALLY-linked BoringSSL.
+# Needed for: Claude Code (Bun), NVM Node.js, Chromium-based tools.
+# The agent scans these binaries for SSL_write / SSL_read function prologues.
+#
+# To find the Claude Code binary:
+#   CLAUDE_BIN=~/.local/share/claude/versions/$(claude --version | head -1)
+# To find the NVM Node.js binary:
+#   ~/.nvm/versions/node/v20.0.0/bin/node
+#
+# ssl_binary_paths:
+#   - /home/user/.local/share/claude/versions/2.1.39
+#   - /home/user/.nvm/versions/node/v20.0.0/bin/node
+
+# Restrict SSL capture to one process name (leave blank to capture all).
+# Useful if you have many TLS processes and only want LLM agent traffic.
+# ssl_comm_filter: python
+
+
+# ── Phase 0: Process/kernel monitoring (process_monitor.bpf.c) ───────────────
+# Captures file opens, subprocess spawning, and outbound connections.
+# These events are correlated with SSL content events by root_pid.
+capture_proc_events: true
+
+# process_monitor_pids: pre-seed with known agent PIDs.
+# Leave empty for auto-discovery mode: the first SSL event from a process
+# automatically registers that process for kernel monitoring.
+# process_monitor_pids:
+#   - 12345
